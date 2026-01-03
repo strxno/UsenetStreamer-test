@@ -1776,41 +1776,45 @@ async function streamHandler(req, res) {
         if (tmdbTitles && tmdbTitles.length > 0 && !isSpecialRequest) {
           console.log(`[TMDB] Adding ${tmdbTitles.length} language-specific search plans`);
           tmdbTitles.forEach((titleObj) => {
-            // For titles with non-ASCII characters, prefer ASCII version for Newznab
-            // Store both in the plan so Newznab can choose ASCII automatically
             const hasNonAscii = /[^\x00-\x7F]/.test(titleObj.title);
-            const queryTitle = hasNonAscii && titleObj.asciiTitle ? titleObj.asciiTitle : titleObj.title;
             
-            let localizedQuery = queryTitle;
+            // Skip non-ASCII titles for indexers that don't handle them well (NZBHydra/Newznab)
+            // Only use ASCII/English titles to avoid false results
+            if (hasNonAscii) {
+              // If we have an ASCII version, use that instead
+              if (titleObj.asciiTitle && titleObj.asciiTitle.trim()) {
+                let asciiQuery = titleObj.asciiTitle;
+                if (type === 'movie' && Number.isFinite(releaseYear)) {
+                  asciiQuery = `${asciiQuery} ${releaseYear}`;
+                } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
+                  asciiQuery = `${asciiQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
+                }
+                const added = addPlan('search', { rawQuery: asciiQuery });
+                if (added) {
+                  console.log(`${INDEXER_LOG_PREFIX} Skipped non-ASCII title "${titleObj.title}", using ASCII: "${asciiQuery}"`);
+                }
+              } else {
+                // No ASCII version available, skip this title to avoid false results
+                console.log(`${INDEXER_LOG_PREFIX} Skipping non-ASCII title "${titleObj.title}" (no ASCII version available)`);
+              }
+              return; // Skip adding the non-ASCII title
+            }
+            
+            // For ASCII titles, add them normally
+            let localizedQuery = titleObj.title;
             if (type === 'movie' && Number.isFinite(releaseYear)) {
               localizedQuery = `${localizedQuery} ${releaseYear}`;
             } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
               localizedQuery = `${localizedQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
             }
             
-            // Include asciiTitle in plan for Newznab to use if needed
-            const asciiQueryTitle = titleObj.asciiTitle && titleObj.asciiTitle !== titleObj.title ? titleObj.asciiTitle : null;
-            let asciiQuery = null;
-            if (asciiQueryTitle) {
-              asciiQuery = asciiQueryTitle;
-              if (type === 'movie' && Number.isFinite(releaseYear)) {
-                asciiQuery = `${asciiQuery} ${releaseYear}`;
-              } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
-                asciiQuery = `${asciiQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
-              }
-            }
-            
-            const added = addPlan('search', { rawQuery: localizedQuery, asciiTitle: asciiQuery });
+            const added = addPlan('search', { rawQuery: localizedQuery });
             if (added) {
-              if (hasNonAscii && asciiQuery) {
-                console.log(`${INDEXER_LOG_PREFIX} Added TMDb ${titleObj.language} search plan (using ASCII for Newznab)`, { query: localizedQuery, asciiQuery });
-              } else {
-                console.log(`${INDEXER_LOG_PREFIX} Added TMDb ${titleObj.language} search plan`, { query: localizedQuery });
-              }
+              console.log(`${INDEXER_LOG_PREFIX} Added TMDb ${titleObj.language} search plan`, { query: localizedQuery });
             }
 
-            // Store first TMDb query for Easynews fallback
-            if (!tmdbLocalizedQuery) {
+            // Store first ASCII TMDb query for Easynews fallback (skip non-ASCII)
+            if (!tmdbLocalizedQuery && !hasNonAscii) {
               tmdbLocalizedQuery = localizedQuery;
             }
           });
@@ -2294,28 +2298,36 @@ async function streamHandler(req, res) {
         console.log(`[EASYNEWS] Easynews search completed in ${Date.now() - easynewsWaitStartTs} ms`);
         
         // If Easynews returned 0 results and we have original title, retry with original
+        // BUT only if original title is ASCII-safe (to avoid false results from non-ASCII characters)
         if (easynewsResults.length === 0 && originalTitle && originalTitle !== movieTitle && originalTitle.trim() && easynewsSearchParams) {
-          console.log(`[EASYNEWS] No results with "${movieTitle}", retrying with original title "${originalTitle}"`);
-          const originalEasynewsQueryParts = [originalTitle];
-          if (type === 'movie' && Number.isFinite(releaseYear)) {
-            originalEasynewsQueryParts.push(String(releaseYear));
-          } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
-            originalEasynewsQueryParts.push(`S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`);
-          }
-          const originalEasynewsQuery = originalEasynewsQueryParts.join(' ').trim();
+          const originalHasNonAscii = /[^\x00-\x7F]/.test(originalTitle);
           
-          if (originalEasynewsQuery) {
-            try {
-              const originalEasynewsResults = await easynewsService.searchEasynews({
-                ...easynewsSearchParams,
-                rawQuery: originalEasynewsQuery,
-              });
-              if (Array.isArray(originalEasynewsResults) && originalEasynewsResults.length > 0) {
-                console.log('[EASYNEWS] Original title search returned results', { count: originalEasynewsResults.length });
-                easynewsResults = originalEasynewsResults;
+          // Skip non-ASCII titles to avoid false results
+          if (originalHasNonAscii) {
+            console.log(`[EASYNEWS] Skipping fallback to original title "${originalTitle}" (contains non-ASCII characters, would cause false results)`);
+          } else {
+            console.log(`[EASYNEWS] No results with "${movieTitle}", retrying with original title "${originalTitle}"`);
+            const originalEasynewsQueryParts = [originalTitle];
+            if (type === 'movie' && Number.isFinite(releaseYear)) {
+              originalEasynewsQueryParts.push(String(releaseYear));
+            } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
+              originalEasynewsQueryParts.push(`S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`);
+            }
+            const originalEasynewsQuery = originalEasynewsQueryParts.join(' ').trim();
+            
+            if (originalEasynewsQuery) {
+              try {
+                const originalEasynewsResults = await easynewsService.searchEasynews({
+                  ...easynewsSearchParams,
+                  rawQuery: originalEasynewsQuery,
+                });
+                if (Array.isArray(originalEasynewsResults) && originalEasynewsResults.length > 0) {
+                  console.log('[EASYNEWS] Original title search returned results', { count: originalEasynewsResults.length });
+                  easynewsResults = originalEasynewsResults;
+                }
+              } catch (err) {
+                console.warn('[EASYNEWS] Original title search failed', err?.message || err);
               }
-            } catch (err) {
-              console.warn('[EASYNEWS] Original title search failed', err?.message || err);
             }
           }
         }
