@@ -166,19 +166,22 @@ function buildHydraSearchParams(plan) {
   // This helps find results even when structured params don't match exactly
   if (plan.rawQuery) {
     // rawQuery takes priority - it's the explicit title/text query
-    params.q = plan.rawQuery.trim();
+    const trimmedQuery = plan.rawQuery.trim();
+    // Only set q if it's not empty, not "undefined", and not "undefined: undefined"
+    if (trimmedQuery && trimmedQuery !== 'undefined' && !trimmedQuery.startsWith('undefined:')) {
+      params.q = trimmedQuery;
+    }
   } else if (plan.query) {
     const queryText = plan.query.trim();
     // Check if query is just tokens (like "{ImdbId:tt123} {Season:1} {Episode:1}")
     const isJustTokens = /^\{[^}]+\}(\s+\{[^}]+\})*$/.test(queryText);
     // If it's just tokens, don't set q (we don't want to search for the literal token string)
-    // If it contains actual text, use it
-    if (!isJustTokens) {
+    // If it contains actual text, use it (but skip if it's "undefined" or starts with "undefined:")
+    if (!isJustTokens && queryText !== 'undefined' && !queryText.startsWith('undefined:')) {
       params.q = queryText;
     }
     // If it's just tokens and we have structured params, we intentionally leave q empty
     // This means the search will rely only on structured params (imdbid, season, ep)
-    // which might be why we're getting undefined results
   }
 
   // If we have tokens but no query text, and this is a tvsearch, we should still try to include a title
@@ -341,6 +344,22 @@ function normalizeHydraResults(data) {
 
 async function executeNzbhydraSearch(plan) {
   const params = buildHydraSearchParams(plan);
+  // Log the query parameters being sent to NZBHydra
+  const logParams = { ...params };
+  if (logParams.apikey) {
+    logParams.apikey = '***';
+  }
+  console.log(`[NZBHYDRA] Sending search query:`, {
+    planType: plan.type,
+    query: params.q || '(no query)',
+    imdbid: params.imdbid || '(none)',
+    tvdbid: params.tvdbid || '(none)',
+    tmdbid: params.tmdbid || '(none)',
+    season: params.season || '(none)',
+    episode: params.ep || '(none)',
+    searchType: params.t,
+    allParams: logParams
+  });
   const response = await axiosGetWithRetry(`${INDEXER_MANAGER_BASE_URL}/api`, {
     params,
     timeout: 60000

@@ -421,6 +421,12 @@ async function fetchSearchResults(query, authOverride = null) {
   params.append('fty[]', 'VIDEO');
 
   const requestUrl = `/2.0/search/solr-search/?${params.toString()}`;
+  // Log the query being sent to Easynews
+  console.log(`[EASYNEWS] Sending search query:`, {
+    query: query || '(empty)',
+    queryLength: query ? query.length : 0,
+    url: requestUrl.replace(/[?&]u=[^&]*/, '[auth]').replace(/[?&]p=[^&]*/, '[auth]')
+  });
   const response = await httpClient.get(requestUrl, buildAuthConfig(authOverride));
   if (response.status === 401 || response.status === 403) {
     throw new Error('Easynews rejected credentials');
@@ -487,8 +493,20 @@ async function searchEasynews(options = {}) {
     query = (fallbackQuery || '').trim();
   }
   if (!query) {
+    console.log(`[EASYNEWS] Skipping search - no query provided`, { rawQuery, fallbackQuery });
     return [];
   }
+  // Log the search options and processed query
+  console.log(`[EASYNEWS] Processing search:`, {
+    rawQuery: rawQuery || '(none)',
+    fallbackQuery: fallbackQuery || '(none)',
+    finalQuery: query,
+    year: year || '(none)',
+    season: season || '(none)',
+    episode: episode || '(none)',
+    strictMode,
+    specialTextOnly
+  });
   const strict = strictMode && !specialTextOnly && !EASYNEWS_SAFE_TEXT_MODE;
   const strictPhrase = strict ? sanitizePhrase(query) : '';
   const queryTokens = strict ? tokenize(query) : [];

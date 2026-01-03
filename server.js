@@ -1690,13 +1690,22 @@ async function streamHandler(req, res) {
         }
         
         searchPlans.forEach((plan) => {
-          if (plan.tokens && plan.tokens.length > 0 && !plan.rawQuery) {
-            // Add title to rawQuery so it's included in the search
-            plan.rawQuery = titleToUse;
-            if (asciiTitleToUse) {
-              plan.asciiTitle = asciiTitleToUse;
+          if (plan.tokens && plan.tokens.length > 0) {
+            // Always update rawQuery if we have a title, even if it was set before
+            // This ensures we don't have undefined titles
+            if (titleToUse && titleToUse.trim() && titleToUse !== 'undefined') {
+              plan.rawQuery = titleToUse;
+              if (asciiTitleToUse) {
+                plan.asciiTitle = asciiTitleToUse;
+              }
+              console.log(`${INDEXER_LOG_PREFIX} Updated ID plan with title: "${titleToUse}"`, { type: plan.type, tokens: plan.tokens, hasNonAscii });
+            } else {
+              // If no valid title, remove rawQuery to avoid "undefined" searches
+              if (plan.rawQuery === 'undefined' || !plan.rawQuery) {
+                delete plan.rawQuery;
+                console.log(`${INDEXER_LOG_PREFIX} ID plan has no valid title, will use structured params only`, { type: plan.type, tokens: plan.tokens });
+              }
             }
-            console.log(`${INDEXER_LOG_PREFIX} Updated ID plan with title: "${titleToUse}"`, { type: plan.type, tokens: plan.tokens, hasNonAscii });
           }
         });
       }
