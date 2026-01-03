@@ -1487,13 +1487,20 @@ async function streamHandler(req, res) {
       return Number.isFinite(parsed) ? parsed : null;
     };
 
-    // Prioritize originalTitle to preserve original language names
+    // Prefer English/title first, fallback to originalTitle if no results found later
     let movieTitle = pickFirstDefined(
       ...collectValues(
-        (src) => src?.originalTitle,
-        (src) => src?.original_title,
         (src) => src?.name,
-        (src) => src?.title
+        (src) => src?.title,
+        (src) => src?.originalTitle,
+        (src) => src?.original_title
+      )
+    );
+    // Store original title separately for fallback
+    let originalTitle = pickFirstDefined(
+      ...collectValues(
+        (src) => src?.originalTitle,
+        (src) => src?.original_title
       )
     );
 
@@ -1564,6 +1571,7 @@ async function streamHandler(req, res) {
       };
 
       // Add ID-based searches immediately (before waiting for TMDb/Cinemeta)
+      // Note: movieTitle might not be available yet, will be added later if needed
       if (type === 'series' && metaIds.tvdb) {
         addPlan('tvsearch', { tokens: [`{TvdbId:${metaIds.tvdb}}`] });
       }
@@ -1605,13 +1613,15 @@ async function streamHandler(req, res) {
             }
           }
           // Create a metadata object compatible with existing code
-          // Prioritize originalTitle from TMDB to preserve original language names
+          // Prefer English title first, but keep originalTitle available for fallback
+          const tmdbEnglishTitle = tmdbMetadata.titles?.find(t => t.language?.startsWith('en-'))?.title;
+          const tmdbPrimaryTitle = tmdbEnglishTitle || tmdbMetadata.originalTitle;
           metaSources.push({
             imdb_id: incomingImdbId,
             tmdb_id: String(tmdbMetadata.tmdbId),
-            title: tmdbMetadata.originalTitle, // Use originalTitle as primary title
-            originalTitle: tmdbMetadata.originalTitle, // Explicitly set originalTitle
-            name: tmdbMetadata.originalTitle, // Also set name for compatibility
+            title: tmdbPrimaryTitle, // Use English title if available, otherwise original
+            originalTitle: tmdbMetadata.originalTitle, // Keep originalTitle for fallback
+            name: tmdbPrimaryTitle, // Also set name for compatibility
             year: tmdbMetadata.year,
             _tmdbTitles: tmdbMetadata.titles, // Store for later use
           });
@@ -1630,13 +1640,22 @@ async function streamHandler(req, res) {
       }
 
       if (!movieTitle) {
-        // Prioritize originalTitle to preserve original language names
+        // Prefer English/title first, fallback to originalTitle if no results found later
         movieTitle = pickFirstDefined(
           ...collectValues(
-            (src) => src?.originalTitle,
-            (src) => src?.original_title,
             (src) => src?.name,
-            (src) => src?.title
+            (src) => src?.title,
+            (src) => src?.originalTitle,
+            (src) => src?.original_title
+          )
+        );
+      }
+      // Store original title separately for fallback if not already set
+      if (!originalTitle) {
+        originalTitle = pickFirstDefined(
+          ...collectValues(
+            (src) => src?.originalTitle,
+            (src) => src?.original_title
           )
         );
       }
@@ -1655,6 +1674,18 @@ async function streamHandler(req, res) {
       }
 
       console.log('[REQUEST] Resolved title/year', { movieTitle, releaseYear, elapsedMs: Date.now() - requestStartTs });
+
+      // Update ID-based plans with title if it's now available
+      // This ensures NZBHydra searches include the title even when tokens are present
+      if (movieTitle && movieTitle.trim()) {
+        searchPlans.forEach((plan) => {
+          if (plan.tokens && plan.tokens.length > 0 && !plan.rawQuery) {
+            // Add title to rawQuery so it's included in the search
+            plan.rawQuery = movieTitle.trim();
+            console.log(`${INDEXER_LOG_PREFIX} Updated ID plan with title: "${movieTitle}"`, { type: plan.type, tokens: plan.tokens });
+          }
+        });
+      }
 
       // Continue with text-based searches using TMDb titles
       const textQueryParts = [];
@@ -1752,34 +1783,31 @@ async function streamHandler(req, res) {
         // Check if we have TMDb titles - prefer original title for Easynews to match original language releases
         const tmdbTitles = metaSources.find(s => s?._tmdbTitles)?._tmdbTitles;
         if (tmdbTitles && tmdbTitles.length > 0) {
-          // Prefer original title from TMDB (first title is usually the original language)
-          // This helps find releases with original language names like "Kompani Lauritzen"
-          const originalTitle = tmdbTitles.find(t => {
-            // Find the title that matches the original language (usually first in array)
-            // or fall back to first non-English title
-            return t.language && !t.language.startsWith('en-');
-          }) || tmdbTitles[0]; // Fallback to first title if no non-English found
-          
-          if (originalTitle) {
-            // Use ASCII version if available (better for Easynews search), otherwise use original
-            easynewsRawQuery = originalTitle.asciiTitle || originalTitle.title;
+          // Prefer English title first for Easynews (better search coverage)
+          // Will fallback to original title if no results found
+          const englishTitle = tmdbTitles.find(t => t.language && t.language.startsWith('en-'));
+          if (englishTitle) {
+            easynewsRawQuery = englishTitle.asciiTitle || englishTitle.title;
             if (type === 'movie' && Number.isFinite(releaseYear)) {
               easynewsRawQuery = `${easynewsRawQuery} ${releaseYear}`;
             } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
               easynewsRawQuery = `${easynewsRawQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
             }
-            console.log('[EASYNEWS] Using original title from TMDb:', easynewsRawQuery, `[${originalTitle.language}]`);
+            console.log('[EASYNEWS] Using English title from TMDb:', easynewsRawQuery);
           } else {
-            // Fallback to English title if no original found
-            const englishTitle = tmdbTitles.find(t => t.language && t.language.startsWith('en-'));
-            if (englishTitle) {
-              easynewsRawQuery = englishTitle.asciiTitle || englishTitle.title;
+            // Fallback to original title if no English found
+            const originalTitleObj = tmdbTitles.find(t => {
+              return t.language && !t.language.startsWith('en-');
+            }) || tmdbTitles[0];
+            
+            if (originalTitleObj) {
+              easynewsRawQuery = originalTitleObj.asciiTitle || originalTitleObj.title;
               if (type === 'movie' && Number.isFinite(releaseYear)) {
                 easynewsRawQuery = `${easynewsRawQuery} ${releaseYear}`;
               } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
                 easynewsRawQuery = `${easynewsRawQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
               }
-              console.log('[EASYNEWS] Using English title from TMDb (fallback):', easynewsRawQuery);
+              console.log('[EASYNEWS] Using original title from TMDb (fallback):', easynewsRawQuery, `[${originalTitleObj.language}]`);
             }
           }
         }
@@ -2078,7 +2106,80 @@ async function streamHandler(req, res) {
       }
 
       const aggregationCount = usingStrictIdMatching ? aggregatedResults.length : resultsByKey.size;
-      if (aggregationCount === 0) {
+      
+      // If no results and we have an original title different from current title, retry with original
+      if (aggregationCount === 0 && originalTitle && originalTitle !== movieTitle && originalTitle.trim()) {
+        console.log(`${INDEXER_LOG_PREFIX} No results with "${movieTitle}", retrying with original title "${originalTitle}"`);
+        
+        // Build new search plans with original title
+        const originalTextQueryParts = [originalTitle];
+        if (type === 'movie' && Number.isFinite(releaseYear)) {
+          originalTextQueryParts.push(String(releaseYear));
+        } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
+          originalTextQueryParts.push(`S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`);
+        }
+        const originalTextQuery = originalTextQueryParts.join(' ').trim();
+        
+        if (originalTextQuery) {
+          const originalPlan = {
+            type: 'search',
+            query: originalTextQuery,
+            rawQuery: originalTextQuery,
+            tokens: [],
+            strictMatch: shouldAddTextSearch && !isSpecialRequest,
+            strictPhrase: shouldAddTextSearch && !isSpecialRequest ? originalTextQuery.toLowerCase().trim() : null
+          };
+          
+          console.log(`${INDEXER_LOG_PREFIX} Retrying with original title plan`, originalPlan);
+          const originalPlanStartTs = Date.now();
+          
+          const originalPlanSettled = await Promise.allSettled([
+            executeManagerPlanWithBackoff(originalPlan),
+            executeNewznabPlan(originalPlan),
+          ]);
+          
+          const originalManagerSet = originalPlanSettled[0];
+          const originalNewznabSet = originalPlanSettled[1];
+          const originalManagerResults = originalManagerSet.status === 'fulfilled' ? (Array.isArray(originalManagerSet.value) ? originalManagerSet.value : []) : [];
+          const originalNewznabResults = originalNewznabSet.status === 'fulfilled' ? (Array.isArray(originalNewznabSet.value?.results) ? originalNewznabSet.value.results : []) : [];
+          const originalCombinedResults = [...originalManagerResults, ...originalNewznabResults];
+          
+          console.log(`${INDEXER_LOG_PREFIX} Original title search returned ${originalCombinedResults.length} results in ${Date.now() - originalPlanStartTs} ms`);
+          
+          if (originalCombinedResults.length > 0) {
+            const originalFiltered = originalCombinedResults.filter((item) => {
+              if (!item || typeof item !== 'object' || !item.downloadUrl) return false;
+              return resultMatchesStrictPlan(originalPlan, item);
+            });
+            
+            originalFiltered.forEach((item) => rawAggregatedResults.push({ result: item, planType: originalPlan.type }));
+            
+            if (usingStrictIdMatching) {
+              aggregatedResults.push(...originalFiltered.map((item) => ({ result: item, planType: originalPlan.type })));
+            } else {
+              for (const item of originalFiltered) {
+                const key = deriveResultKey(item);
+                if (key && !resultsByKey.has(key)) {
+                  resultsByKey.set(key, { result: item, planType: originalPlan.type });
+                }
+              }
+            }
+            
+            planSummaries.push({
+              planType: originalPlan.type,
+              query: originalPlan.query,
+              total: originalCombinedResults.length,
+              filtered: originalFiltered.length,
+              uniqueAdded: originalFiltered.length,
+              managerCount: originalManagerResults.length,
+              newznabCount: originalNewznabResults.length,
+            });
+          }
+        }
+      }
+      
+      const finalAggregationCount = usingStrictIdMatching ? aggregatedResults.length : resultsByKey.size;
+      if (finalAggregationCount === 0) {
         console.warn(`${INDEXER_LOG_PREFIX} ⚠ All ${searchPlans.length} search plans returned no NZB results`);
       } else if (usingStrictIdMatching) {
         console.log(`${INDEXER_LOG_PREFIX} ✅ Aggregated NZB results with strict ID matching`, {
@@ -2138,6 +2239,34 @@ async function streamHandler(req, res) {
           console.warn('[EASYNEWS] Search timed out or failed', err?.message || err);
         }
         console.log(`[EASYNEWS] Easynews search completed in ${Date.now() - easynewsWaitStartTs} ms`);
+        
+        // If Easynews returned 0 results and we have original title, retry with original
+        if (easynewsResults.length === 0 && originalTitle && originalTitle !== movieTitle && originalTitle.trim() && easynewsSearchParams) {
+          console.log(`[EASYNEWS] No results with "${movieTitle}", retrying with original title "${originalTitle}"`);
+          const originalEasynewsQueryParts = [originalTitle];
+          if (type === 'movie' && Number.isFinite(releaseYear)) {
+            originalEasynewsQueryParts.push(String(releaseYear));
+          } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
+            originalEasynewsQueryParts.push(`S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`);
+          }
+          const originalEasynewsQuery = originalEasynewsQueryParts.join(' ').trim();
+          
+          if (originalEasynewsQuery) {
+            try {
+              const originalEasynewsResults = await easynewsService.searchEasynews({
+                ...easynewsSearchParams,
+                rawQuery: originalEasynewsQuery,
+              });
+              if (Array.isArray(originalEasynewsResults) && originalEasynewsResults.length > 0) {
+                console.log('[EASYNEWS] Original title search returned results', { count: originalEasynewsResults.length });
+                easynewsResults = originalEasynewsResults;
+              }
+            } catch (err) {
+              console.warn('[EASYNEWS] Original title search failed', err?.message || err);
+            }
+          }
+        }
+        
         if (Array.isArray(easynewsResults) && easynewsResults.length > 0) {
           console.log('[EASYNEWS] Adding results to final list', { count: easynewsResults.length });
           easynewsResults.forEach((item) => {

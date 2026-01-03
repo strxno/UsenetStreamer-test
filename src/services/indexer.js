@@ -161,10 +161,22 @@ function buildHydraSearchParams(plan) {
     plan.tokens.forEach((token) => applyTokenToHydraParams(token, params));
   }
 
+  // Include title in query parameter even when tokens are present
+  // NZBHydra can use both structured params (season/ep) and text query together
   if (plan.rawQuery) {
     params.q = plan.rawQuery;
-  } else if ((!plan.tokens || plan.tokens.length === 0) && plan.query) {
-    params.q = plan.query;
+  } else if (plan.query) {
+    // Extract title from query if it contains tokens
+    // If query is just tokens (like "{ImdbId:tt123} {Season:1} {Episode:1}"), 
+    // we need to get the title from elsewhere or use the query as-is
+    // For now, use the query which may contain the title if it was included
+    const queryText = plan.query.trim();
+    // Only set q if it's not just tokens (tokens are already in structured params)
+    // Check if query looks like it contains actual text, not just token patterns
+    const isJustTokens = /^\{[^}]+\}(\s+\{[^}]+\})*$/.test(queryText);
+    if (!isJustTokens || !plan.tokens || plan.tokens.length === 0) {
+      params.q = queryText;
+    }
   }
 
   return params;
