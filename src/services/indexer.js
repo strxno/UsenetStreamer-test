@@ -161,23 +161,29 @@ function buildHydraSearchParams(plan) {
     plan.tokens.forEach((token) => applyTokenToHydraParams(token, params));
   }
 
-  // Include title in query parameter even when tokens are present
-  // NZBHydra can use both structured params (season/ep) and text query together
+  // Always include title in query parameter when available
+  // NZBHydra can use both structured params (season/ep/imdbid) and text query together
+  // This helps find results even when structured params don't match exactly
   if (plan.rawQuery) {
-    params.q = plan.rawQuery;
+    // rawQuery takes priority - it's the explicit title/text query
+    params.q = plan.rawQuery.trim();
   } else if (plan.query) {
-    // Extract title from query if it contains tokens
-    // If query is just tokens (like "{ImdbId:tt123} {Season:1} {Episode:1}"), 
-    // we need to get the title from elsewhere or use the query as-is
-    // For now, use the query which may contain the title if it was included
     const queryText = plan.query.trim();
-    // Only set q if it's not just tokens (tokens are already in structured params)
-    // Check if query looks like it contains actual text, not just token patterns
+    // Check if query is just tokens (like "{ImdbId:tt123} {Season:1} {Episode:1}")
     const isJustTokens = /^\{[^}]+\}(\s+\{[^}]+\})*$/.test(queryText);
-    if (!isJustTokens || !plan.tokens || plan.tokens.length === 0) {
+    // If it's just tokens, don't set q (we don't want to search for the literal token string)
+    // If it contains actual text, use it
+    if (!isJustTokens) {
       params.q = queryText;
     }
+    // If it's just tokens and we have structured params, we intentionally leave q empty
+    // This means the search will rely only on structured params (imdbid, season, ep)
+    // which might be why we're getting undefined results
   }
+
+  // If we have tokens but no query text, and this is a tvsearch, we should still try to include a title
+  // But we can't do that here since we don't have access to the title
+  // The title should be added to rawQuery before this function is called
 
   return params;
 }

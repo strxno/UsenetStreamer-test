@@ -1542,7 +1542,7 @@ async function streamHandler(req, res) {
     if (!usingCachedSearchResults) {
       const searchPlans = [];
       const seenPlans = new Set();
-      const addPlan = (planType, { tokens = [], rawQuery = null } = {}) => {
+      const addPlan = (planType, { tokens = [], rawQuery = null, asciiTitle = null } = {}) => {
         const tokenList = [...tokens];
         if (planType === 'tvsearch') {
           if (seasonToken) tokenList.push(seasonToken);
@@ -1559,6 +1559,10 @@ async function streamHandler(req, res) {
         }
         seenPlans.add(planKey);
         const planRecord = { type: planType, query, rawQuery: rawQuery ? rawQuery : null, tokens: normalizedTokens };
+        // Store asciiTitle for Newznab searches to avoid non-ASCII character issues
+        if (asciiTitle) {
+          planRecord.asciiTitle = asciiTitle;
+        }
         if (strictTextMode && planType === 'search' && rawQuery) {
           const strictPhrase = sanitizeStrictSearchPhrase(rawQuery);
           if (strictPhrase) {
@@ -1570,8 +1574,8 @@ async function streamHandler(req, res) {
         return true;
       };
 
-      // Add ID-based searches immediately (before waiting for TMDb/Cinemeta)
-      // Note: movieTitle might not be available yet, will be added later if needed
+      // Add ID-based searches (will start after title is resolved)
+      // Note: We'll add the title to these plans before executing them
       if (type === 'series' && metaIds.tvdb) {
         addPlan('tvsearch', { tokens: [`{TvdbId:${metaIds.tvdb}}`] });
       }
@@ -1582,21 +1586,6 @@ async function streamHandler(req, res) {
 
       if (searchPlans.length === 0 && metaIds.imdb) {
         addPlan(searchType, { tokens: [`{ImdbId:${metaIds.imdb}}`] });
-      }
-
-      // Start ID-based searches immediately in background
-      const idSearchPromises = [];
-      const idSearchStartTs = Date.now();
-      if (searchPlans.length > 0) {
-        console.log(`${INDEXER_LOG_PREFIX} Starting ${searchPlans.length} ID-based search(es) immediately`);
-        idSearchPromises.push(...searchPlans.map((plan) => {
-          console.log(`${INDEXER_LOG_PREFIX} Dispatching early ID plan`, plan);
-          const planStartTs = Date.now();
-          return Promise.allSettled([
-            executeManagerPlanWithBackoff(plan),
-            executeNewznabPlan(plan),
-          ]).then((settled) => ({ plan, settled, startTs: planStartTs, endTs: Date.now() }));
-        }));
       }
 
       // Now wait for TMDb to get localized titles (if applicable)
@@ -1677,14 +1666,55 @@ async function streamHandler(req, res) {
 
       // Update ID-based plans with title if it's now available
       // This ensures NZBHydra searches include the title even when tokens are present
+      // For Newznab, prefer ASCII version if title contains non-ASCII characters
       if (movieTitle && movieTitle.trim()) {
+        const hasNonAscii = /[^\x00-\x7F]/.test(movieTitle);
+        let titleToUse = movieTitle.trim();
+        let asciiTitleToUse = null;
+        
+        // Check if we have ASCII version from TMDB
+        const tmdbTitles = metaSources.find(s => s?._tmdbTitles)?._tmdbTitles;
+        if (hasNonAscii && tmdbTitles) {
+          // Find English title or ASCII version
+          const englishTitle = tmdbTitles.find(t => t.language?.startsWith('en-'));
+          if (englishTitle) {
+            titleToUse = englishTitle.title;
+            asciiTitleToUse = englishTitle.asciiTitle || null;
+          } else {
+            // Try to find any ASCII title
+            const asciiTitleObj = tmdbTitles.find(t => t.asciiTitle && !/[^\x00-\x7F]/.test(t.asciiTitle));
+            if (asciiTitleObj) {
+              titleToUse = asciiTitleObj.asciiTitle;
+            }
+          }
+        }
+        
         searchPlans.forEach((plan) => {
           if (plan.tokens && plan.tokens.length > 0 && !plan.rawQuery) {
             // Add title to rawQuery so it's included in the search
-            plan.rawQuery = movieTitle.trim();
-            console.log(`${INDEXER_LOG_PREFIX} Updated ID plan with title: "${movieTitle}"`, { type: plan.type, tokens: plan.tokens });
+            plan.rawQuery = titleToUse;
+            if (asciiTitleToUse) {
+              plan.asciiTitle = asciiTitleToUse;
+            }
+            console.log(`${INDEXER_LOG_PREFIX} Updated ID plan with title: "${titleToUse}"`, { type: plan.type, tokens: plan.tokens, hasNonAscii });
           }
         });
+      }
+
+      // Start ID-based searches now that we have the title
+      const idSearchPromises = [];
+      const idSearchStartTs = Date.now();
+      const idPlansToExecute = searchPlans.filter(p => p.tokens && p.tokens.length > 0);
+      if (idPlansToExecute.length > 0) {
+        console.log(`${INDEXER_LOG_PREFIX} Starting ${idPlansToExecute.length} ID-based search(es) with title`);
+        idSearchPromises.push(...idPlansToExecute.map((plan) => {
+          console.log(`${INDEXER_LOG_PREFIX} Dispatching ID plan`, plan);
+          const planStartTs = Date.now();
+          return Promise.allSettled([
+            executeManagerPlanWithBackoff(plan),
+            executeNewznabPlan(plan),
+          ]).then((settled) => ({ plan, settled, startTs: planStartTs, endTs: Date.now() }));
+        }));
       }
 
       // Continue with text-based searches using TMDb titles
@@ -1718,9 +1748,21 @@ async function streamHandler(req, res) {
         const fallbackIdentifier = hasTmdbTitles ? null : (incomingImdbId || baseIdentifier);
         textQueryFallbackValue = (textQueryCandidate || fallbackIdentifier || '').trim();
         if (textQueryFallbackValue) {
-          const addedTextPlan = addPlan('search', { rawQuery: textQueryFallbackValue });
+          // Check if we need ASCII version for Newznab
+          const hasNonAscii = /[^\x00-\x7F]/.test(textQueryFallbackValue);
+          let asciiFallback = null;
+          if (hasNonAscii) {
+            const tmdbTitles = metaSources.find(s => s?._tmdbTitles)?._tmdbTitles;
+            if (tmdbTitles) {
+              const englishTitle = tmdbTitles.find(t => t.language?.startsWith('en-'));
+              if (englishTitle) {
+                asciiFallback = `${englishTitle.asciiTitle || englishTitle.title}${textQueryFallbackValue.replace(/^[^\x00-\x7F]+/, '').replace(/[^\x00-\x7F]+$/, '')}`.trim();
+              }
+            }
+          }
+          const addedTextPlan = addPlan('search', { rawQuery: textQueryFallbackValue, asciiTitle: asciiFallback });
           if (addedTextPlan) {
-            console.log(`${INDEXER_LOG_PREFIX} Added text search plan`, { query: textQueryFallbackValue });
+            console.log(`${INDEXER_LOG_PREFIX} Added text search plan`, { query: textQueryFallbackValue, hasNonAscii, asciiFallback: asciiFallback || 'none' });
           } else {
             console.log(`${INDEXER_LOG_PREFIX} Text search plan already present`, { query: textQueryFallbackValue });
           }
@@ -1734,28 +1776,36 @@ async function streamHandler(req, res) {
         if (tmdbTitles && tmdbTitles.length > 0 && !isSpecialRequest) {
           console.log(`[TMDB] Adding ${tmdbTitles.length} language-specific search plans`);
           tmdbTitles.forEach((titleObj) => {
-            let localizedQuery = titleObj.title;
+            // For titles with non-ASCII characters, prefer ASCII version for Newznab
+            // Store both in the plan so Newznab can choose ASCII automatically
+            const hasNonAscii = /[^\x00-\x7F]/.test(titleObj.title);
+            const queryTitle = hasNonAscii && titleObj.asciiTitle ? titleObj.asciiTitle : titleObj.title;
+            
+            let localizedQuery = queryTitle;
             if (type === 'movie' && Number.isFinite(releaseYear)) {
               localizedQuery = `${localizedQuery} ${releaseYear}`;
             } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
               localizedQuery = `${localizedQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
             }
-            const added = addPlan('search', { rawQuery: localizedQuery });
-            if (added) {
-              console.log(`${INDEXER_LOG_PREFIX} Added TMDb ${titleObj.language} search plan`, { query: localizedQuery });
-            }
-
-            // Add ASCII fallback if different
-            if (titleObj.asciiTitle && titleObj.asciiTitle !== titleObj.title) {
-              let asciiQuery = titleObj.asciiTitle;
+            
+            // Include asciiTitle in plan for Newznab to use if needed
+            const asciiQueryTitle = titleObj.asciiTitle && titleObj.asciiTitle !== titleObj.title ? titleObj.asciiTitle : null;
+            let asciiQuery = null;
+            if (asciiQueryTitle) {
+              asciiQuery = asciiQueryTitle;
               if (type === 'movie' && Number.isFinite(releaseYear)) {
                 asciiQuery = `${asciiQuery} ${releaseYear}`;
               } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
                 asciiQuery = `${asciiQuery} S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`;
               }
-              const addedAscii = addPlan('search', { rawQuery: asciiQuery });
-              if (addedAscii) {
-                console.log(`${INDEXER_LOG_PREFIX} Added TMDb ${titleObj.language} ASCII search plan`, { query: asciiQuery });
+            }
+            
+            const added = addPlan('search', { rawQuery: localizedQuery, asciiTitle: asciiQuery });
+            if (added) {
+              if (hasNonAscii && asciiQuery) {
+                console.log(`${INDEXER_LOG_PREFIX} Added TMDb ${titleObj.language} search plan (using ASCII for Newznab)`, { query: localizedQuery, asciiQuery });
+              } else {
+                console.log(`${INDEXER_LOG_PREFIX} Added TMDb ${titleObj.language} search plan`, { query: localizedQuery });
               }
             }
 
@@ -1981,7 +2031,10 @@ async function streamHandler(req, res) {
       }
 
       // Now execute remaining text-based search plans (exclude already-processed ID plans)
-      const remainingPlans = searchPlans.filter(p => !processedIdPlans.has(`${p.type}|${p.query}`));
+      const remainingPlans = searchPlans.filter(p => {
+        const planKey = `${p.type}|${p.query}`;
+        return !processedIdPlans.has(planKey) && (!p.tokens || p.tokens.length === 0);
+      });
       console.log(`${INDEXER_LOG_PREFIX} Executing ${remainingPlans.length} text-based search plan(s)`);
       const textSearchStartTs = Date.now();
       const planExecutions = remainingPlans.map((plan) => {

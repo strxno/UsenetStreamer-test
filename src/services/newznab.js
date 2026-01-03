@@ -355,6 +355,27 @@ function applyTokenToParams(token, params) {
   }
 }
 
+/**
+ * Check if string contains non-ASCII characters
+ */
+function containsNonAscii(text) {
+  if (!text || typeof text !== 'string') return false;
+  return /[^\x00-\x7F]/.test(text);
+}
+
+/**
+ * Normalize text to ASCII (strip diacritics and non-ASCII chars)
+ * Similar to TMDB's normalizeToAscii but simpler for Newznab
+ */
+function normalizeToAscii(text) {
+  if (!text || typeof text !== 'string') return '';
+  return text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\x00-\x7F]/g, '')
+    .trim();
+}
+
 function buildSearchParams(plan) {
   const params = {
     t: mapPlanType(plan?.type),
@@ -362,11 +383,34 @@ function buildSearchParams(plan) {
   if (Array.isArray(plan?.tokens)) {
     plan.tokens.forEach((token) => applyTokenToParams(token, params));
   }
+  
+  // For Newznab indexers, prefer ASCII-only queries to avoid false results
+  // Many indexers (like DrunkenSlug) don't handle non-ASCII characters well
+  let queryText = null;
   if (plan?.rawQuery) {
-    params.q = plan.rawQuery;
+    queryText = plan.rawQuery;
   } else if ((!plan?.tokens || plan.tokens.length === 0) && plan?.query) {
-    params.q = plan.query;
+    queryText = plan.query;
   }
+  
+  if (queryText) {
+    // If query contains non-ASCII characters, try to use ASCII version
+    if (containsNonAscii(queryText)) {
+      // Check if plan has asciiTitle from TMDB
+      const asciiVersion = plan?.asciiTitle || normalizeToAscii(queryText);
+      if (asciiVersion && asciiVersion.trim() && asciiVersion !== queryText) {
+        console.log(`[NEWZNAB] Query contains non-ASCII characters, using ASCII version: "${asciiVersion}" (was: "${queryText}")`);
+        params.q = asciiVersion;
+      } else {
+        // If we can't get ASCII version, skip the query to avoid false results
+        console.warn(`[NEWZNAB] Query contains non-ASCII characters but no ASCII version available, skipping query: "${queryText}"`);
+        // Don't set params.q - rely on structured params (imdbid, season, ep) only
+      }
+    } else {
+      params.q = queryText;
+    }
+  }
+  
   return params;
 }
 
